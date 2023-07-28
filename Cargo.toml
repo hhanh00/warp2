@@ -1,0 +1,28 @@
+[package]
+name = "warp2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.40"
+byteorder = "1.4.3"
+rayon = "1.7.0"
+hex = "0.4.3"
+ff = "0.13.0"
+group = "0.13.0"
+prost = "0.10.3"
+tonic = "0.7.2"
+log = "0.4.19"
+lazy_static = "1.4.0"
+jubjub = "0.10.0"
+tiny-bip39 = "0.8"
+tokio = { version = "1.6", features = ["macros", "rt-multi-thread", "time"] }
+
+[dependencies.zcash_client_backend]
+version = "0.9.0"
+
+[dependencies.zcash_note_encryption]
+version = "0.3.0"
+
+[dependencies.zcash_primitives]
+version = "0.11.0"
