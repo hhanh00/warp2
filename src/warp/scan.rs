@@ -5,30 +5,30 @@ use byteorder::{ReadBytesExt, LE};
 use prost::Message;
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::marker::PhantomData;
 use std::slice;
+use std::sync::mpsc::channel;
 use std::time::Instant;
+use allo_isolate::IntoDart;
 use zcash_client_backend::encoding::decode_extended_full_viewing_key;
 use zcash_note_encryption::batch::try_compact_note_decryption;
 use zcash_note_encryption::{EphemeralKeyBytes, ShieldedOutput};
 use zcash_primitives::consensus::{BlockHeight, Network, Parameters};
 use zcash_primitives::sapling::note_encryption::{PreparedIncomingViewingKey, SaplingDomain};
 use zcash_primitives::sapling::Note;
+use crate::lw_rpc::CompactBlock;
 
-pub async fn full_scan(network: &Network, fvk: &str) -> Result<()> {
+pub async fn full_scan(network: &Network, url: &str, fvk: &str, port: i64) -> Result<u64> {
     let zfvk =
         decode_extended_full_viewing_key(network.hrp_sapling_extended_full_viewing_key(), fvk)
             .unwrap();
     let nk = &zfvk.fvk.vk.nk;
     let ivk = zfvk.fvk.vk.ivk();
     let pivk = PreparedIncomingViewingKey::new(&ivk);
-    let f = File::open("compact.dat")?;
-    let mut f = BufReader::new(f);
+    let response = ureq::get(url).call()?;
+    let mut reader = response.into_reader();
     let final_height = 2166554;
-    let mut block_chunk = vec![];
-    let mut block_height = 0;
     let mut height;
     let mut tx_count = 0;
     let mut pos = 0;
@@ -37,108 +37,58 @@ pub async fn full_scan(network: &Network, fvk: &str) -> Result<()> {
     let mut balance = 0i64;
 
     let start_time = Instant::now();
-    while let Ok(len) = f.read_u32::<LE>() {
-        let mut buf = vec![0; len as usize];
-        f.read_exact(&mut buf)?;
-        let cb = crate::lw_rpc::CompactBlock::decode(&*buf)?;
-        block_height = cb.height;
-        tx_count += cb.vtx.len();
-        block_chunk.push(cb);
 
-        if tx_count > 100_000 || block_height == final_height {
-            height = block_height;
-            println!("Height: {height}");
-            let dec_block_chunk: Vec<_> = block_chunk
-                .par_iter()
-                .map(|b| decrypt_block(network, b, &pivk).unwrap())
-                .collect();
-
-            let mut notes = vec![];
-            let mut bridges: Option<Bridge<SaplingHasher>> = None;
-            let mut pos_start = pos;
-            for db in dec_block_chunk.iter() {
-                for n in db.notes.iter() {
-                    let note = &n.1;
-                    let p = pos + n.0;
-                    let nf = note.nf(nk, p as u64);
-                    let nv = note.value().inner();
-                    balance += nv as i64;
-                    nfs.insert(nf.0, (p, nv));
-                    notes.push((p, n.1.clone()));
-                }
-                pos += db.count_outputs;
+    let (tx_blocks, rx_blocks) = channel::<Vec<CompactBlock>>();
+    std::thread::spawn(move || {
+        let mut block_chunk = vec![];
+        while let Ok(len) = reader.read_u32::<LE>() {
+            let mut buf = vec![0; len as usize];
+            reader.read_exact(&mut buf)?;
+            let cb: CompactBlock = CompactBlock::decode(&*buf)?;
+            let height = cb.height;
+            tx_count += cb.vtx.len();
+            block_chunk.push(cb);
+            if tx_count > 100_000 || height == final_height {
+                let blocks = block_chunk;
+                block_chunk = vec![];
+                tx_count = 0;
+                tx_blocks.send(blocks)?;
             }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
 
-            let mut cmus: Vec<(super::Hash, bool)> = vec![];
-            for (b, db) in block_chunk.iter().zip(dec_block_chunk.iter()) {
-                // flush bridges or cmus (only one should exist)
-                if let Some(bridge) = bridges.take() {
-                    // flush bridges
-                    cmtree.add_bridge(&bridge);
-                }
-                if !cmus.is_empty() {
-                    // flush nodes
-                    cmtree.add_nodes(0, 0, &cmus);
-                    cmus.clear();
-                }
-                assert_eq!(pos_start as usize, cmtree.pos);
-                assert!(bridges.is_none());
-                assert!(cmus.is_empty());
-
-                if db.notes.is_empty() {
-                    // block has no new notes, use the block bridge
-                    if let Some(bridge) = b.sapling_bridge.as_ref() {
-                        let bridge = Bridge::read(&*bridge.data, &SaplingHasher::default())?;
-                        cmtree.add_bridge(&bridge);
-                        pos_start += bridge.len as u32;
-                        assert_eq!(pos_start as usize, cmtree.pos);
-                    }
-                } else {
-                    for tx in b.vtx.iter() {
-                        if let Some(sapling_bridge) = tx.sapling_bridge.as_ref() {
-                            // tx was pruned
-                            if !cmus.is_empty() {
-                                // flush nodes
-                                cmtree.add_nodes(0, 0, &cmus);
-                                cmus.clear();
-                            }
-
-                            // accumulate bridge
-                            let bridge =
-                                Bridge::read(&*sapling_bridge.data, &SaplingHasher::default())?;
-                            pos_start += bridge.len as u32;
-                            bridges = match bridges.take() {
-                                Some(mut b) => {
-                                    b.merge(&bridge, &cmtree.h);
-                                    Some(b)
-                                }
-                                None => Some(bridge),
-                            };
-                        } else {
-                            if let Some(bridge) = bridges.take() {
-                                // flush bridges
-                                cmtree.add_bridge(&bridge);
-                            }
-
-                            // accumulate cmus
-                            for o in tx.outputs.iter() {
-                                cmus.push((o.cmu.clone().try_into().unwrap(), false));
-                            }
-                            pos_start += tx.outputs.len() as u32;
-                            let cmus_pos_start = pos_start - cmus.len() as u32;
-                            while !notes.is_empty() {
-                                let n = &notes[0];
-                                if (n.0 - cmus_pos_start) as usize >= cmus.len() {
-                                    break;
-                                }
-                                cmus[(n.0 - cmus_pos_start) as usize].1 = true;
-                                notes.remove(0);
-                            }
-                        }
-                    }
-                }
+    while let Ok(block_chunk) = rx_blocks.recv() {
+        height = block_chunk[0].height;
+        println!("\x1b[0;31mHeight: {height}\x1b[0m");
+        unsafe {
+            if let Some(post) = crate::api::POST_COBJ {
+                post(port, &mut height.into_dart());
             }
+        }
+        let dec_block_chunk: Vec<_> = block_chunk
+            .par_iter()
+            .map(|b| decrypt_block(network, b, &pivk).unwrap())
+            .collect();
 
+        let mut notes = vec![];
+        let mut bridges: Option<Bridge<SaplingHasher>> = None;
+        let mut pos_start = pos;
+        for db in dec_block_chunk.iter() {
+            for n in db.notes.iter() {
+                let note = &n.1;
+                let p = pos + n.0;
+                let nf = note.nf(nk, p as u64);
+                let nv = note.value().inner();
+                balance += nv as i64;
+                nfs.insert(nf.0, (p, nv));
+                notes.push((p, n.1.clone()));
+            }
+            pos += db.count_outputs;
+        }
+
+        let mut cmus: Vec<(super::Hash, bool)> = vec![];
+        for (b, db) in block_chunk.iter().zip(dec_block_chunk.iter()) {
             // flush bridges or cmus (only one should exist)
             if let Some(bridge) = bridges.take() {
                 // flush bridges
@@ -150,28 +100,92 @@ pub async fn full_scan(network: &Network, fvk: &str) -> Result<()> {
                 cmus.clear();
             }
             assert_eq!(pos_start as usize, cmtree.pos);
+            assert!(bridges.is_none());
+            assert!(cmus.is_empty());
 
-            // detect spends
-            for b in block_chunk.iter() {
+            if db.notes.is_empty() {
+                // block has no new notes, use the block bridge
+                if let Some(bridge) = b.sapling_bridge.as_ref() {
+                    let bridge = Bridge::read(&*bridge.data, &SaplingHasher::default())?;
+                    cmtree.add_bridge(&bridge);
+                    pos_start += bridge.len as u32;
+                    assert_eq!(pos_start as usize, cmtree.pos);
+                }
+            } else {
                 for tx in b.vtx.iter() {
-                    for s in tx.spends.iter() {
-                        if nfs.contains_key(&*s.nf) {
-                            let (p, nv) = nfs[&*s.nf];
-                            nfs.remove(&*s.nf);
-                            cmtree.remove_witness(p as usize);
-                            println!("Spent {nv}");
-                            balance -= nv as i64;
+                    if let Some(sapling_bridge) = tx.sapling_bridge.as_ref() {
+                        // tx was pruned
+                        if !cmus.is_empty() {
+                            // flush nodes
+                            cmtree.add_nodes(0, 0, &cmus);
+                            cmus.clear();
+                        }
+
+                        // accumulate bridge
+                        let bridge =
+                            Bridge::read(&*sapling_bridge.data, &SaplingHasher::default())?;
+                        pos_start += bridge.len as u32;
+                        bridges = match bridges.take() {
+                            Some(mut b) => {
+                                b.merge(&bridge, &cmtree.h);
+                                Some(b)
+                            }
+                            None => Some(bridge),
+                        };
+                    } else {
+                        if let Some(bridge) = bridges.take() {
+                            // flush bridges
+                            cmtree.add_bridge(&bridge);
+                        }
+
+                        // accumulate cmus
+                        for o in tx.outputs.iter() {
+                            cmus.push((o.cmu.clone().try_into().unwrap(), false));
+                        }
+                        pos_start += tx.outputs.len() as u32;
+                        let cmus_pos_start = pos_start - cmus.len() as u32;
+                        while !notes.is_empty() {
+                            let n = &notes[0];
+                            if (n.0 - cmus_pos_start) as usize >= cmus.len() {
+                                break;
+                            }
+                            cmus[(n.0 - cmus_pos_start) as usize].1 = true;
+                            notes.remove(0);
                         }
                     }
                 }
             }
+        }
 
-            block_chunk.clear();
-            tx_count = 0;
+        // flush bridges or cmus (only one should exist)
+        if let Some(bridge) = bridges.take() {
+            // flush bridges
+            cmtree.add_bridge(&bridge);
+        }
+        if !cmus.is_empty() {
+            // flush nodes
+            cmtree.add_nodes(0, 0, &cmus);
+            cmus.clear();
+        }
+        assert_eq!(pos_start as usize, cmtree.pos);
+
+        // detect spends
+        for b in block_chunk.iter() {
+            for tx in b.vtx.iter() {
+                for s in tx.spends.iter() {
+                    if nfs.contains_key(&*s.nf) {
+                        let (p, nv) = nfs[&*s.nf];
+                        nfs.remove(&*s.nf);
+                        cmtree.remove_witness(p as usize);
+                        println!("Spent {nv}");
+                        balance -= nv as i64;
+                    }
+                }
+            }
         }
     }
 
-    println!("Final height = {block_height}");
+    println!("Final height = {final_height}");
     let duration = start_time.elapsed();
     println!("Time elapsed in sapling full scan is: {:?}", duration);
 
@@ -196,7 +210,7 @@ pub async fn full_scan(network: &Network, fvk: &str) -> Result<()> {
     // let root = tree.root();
     // println!("server root {}", hex::encode(&root.repr));
 
-    Ok(())
+    Ok(balance as u64)
 }
 
 struct EncryptedOutput<P> {
